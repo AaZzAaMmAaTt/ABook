@@ -54,7 +54,7 @@ Data from how many times the "Book Read" button is pressed is collected to build
 ### 🌐 Live Bot
 The bot is hosted and intended to be **always online**. You can access it directly on Telegram without any setup.
 
-> 🔗 **Bot link:** *(Add your bot's Telegram link here, e.g., `https://t.me/@ABookProjectBot`)*
+> 🔗 **Bot link:** *(Add your bot's Telegram link here, e.g., `[https://t.me/@ABookProjectBot](https://t.me/ABookProjectBot)`)*
 
 ---
 
