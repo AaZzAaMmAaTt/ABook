@@ -52,8 +52,10 @@ Data from how many times the "Book Read" button is pressed is collected to build
 ## 🚀 Getting Started
 
 ### 🌐 Live Bot
-The bot is hosted and intended to be **always online**. You can access it directly on Telegram without any setup.
+The bot may not always be online, as it's hosted on a local device. If the bot doesn't respond, please message me on Telegram and I'll restart it as soon as possible.
 
+> 💬 **Contact:** [@nematovich_a](https://t.me/nematovich_a)
+> 
 > 🔗 **Bot link:** *(Add your bot's Telegram link here, e.g., `[https://t.me/@ABookProjectBot](https://t.me/ABookProjectBot)`)*
 
 ---
@@ -74,3 +76,17 @@ If you still want to try running it locally:
 ```bash
 git clone https://github.com/AaZzAaMmAaTt/ABook.git
 cd ABook
+
+Step 2: Set Up Environment
+Create a .env file in the project root and add your bot token:
+BOT_TOKEN=your_telegram_bot_token_here
+
+Step 3: Run the Bot
+python main.py
+
+🤝 Connect & Support
+If the bot is not responding or you have any questions, feel free to reach out:
+💬 Telegram: @nematovich_a
+🐙 GitHub Issues: Open an issue
+I'll get the bot back online as soon as possible!
+Happy reading with ABook! 📚✨
