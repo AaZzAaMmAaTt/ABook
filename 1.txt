@@ -1,0 +1,570 @@
+import asyncio
+import os
+from datetime import datetime
+import aiosqlite
+from aiogram import F, Bot, Dispatcher, types
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.filters import Command
+from dotenv import load_dotenv
+import logging
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+dp = Dispatcher(storage=MemoryStorage())
+
+logging.basicConfig(level=logging.INFO)
+
+
+# ==================== БЕЗОПАСНОЕ РЕДАКТИРОВАНИЕ СООБЩЕНИЙ ====================
+async def safe_edit_message(orig_message: types.Message, text: str, reply_markup=None, parse_mode="Markdown"):
+    """Попробует edit_caption (если есть caption у сообщения), иначе edit_text."""
+    try:
+        if getattr(orig_message, "caption", None) is not None:
+            await orig_message.edit_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await orig_message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        logging.warning("TelegramBadRequest при редактировании: %s", e)
+        try:
+            await orig_message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as ex:
+            logging.exception("Не удалось отправить fallback-сообщение: %s", ex)
+
+
+
+
+# ==================== НАСТРОЙКА ТОКЕНА И АДМИНОВ ====================
+load_dotenv(dotenv_path="C:/Users/User/Desktop/bot/.env")
+
+BOT_TOKEN = os.getenv("TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")  # теперь можно несколько ID через запятую
+
+if not BOT_TOKEN:
+    raise ValueError("❌ Ошибка: переменная TOKEN не найдена в .env")
+if not ADMIN_ID:
+    raise ValueError("❌ Ошибка: переменная ADMIN_ID не найдена в .env")
+
+# Разрешаем несколько ID (через запятую)
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID.split(",") if x.strip().isdigit()]
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+DB_PATH = "data/database.db"
+
+
+# ==================== ПРОВЕРКА АДМИНА ====================
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом."""
+    return user_id in ADMIN_IDS
+
+
+
+
+
+# ==================== ИНИЦИАЛИЗАЦИЯ БАЗЫ ====================
+async def init_db():
+    os.makedirs("data", exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_seen DATE,
+            read_books INTEGER DEFAULT 0
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            description TEXT,
+            file_path TEXT,
+            cover_path TEXT
+        )
+        """)
+        await db.commit()
+
+
+# ==================== КНОПКИ ====================
+def start_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧑 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="📚 Каталог", callback_data="catalog")]
+    ])
+
+def back_to_start_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅Назад", callback_data="back_to_start")]
+    ])
+
+def book_keyboard(book_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Читать", callback_data=f"read_{book_id}")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_catalog")]
+    ])
+
+
+
+
+# ==================== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ ====================
+async def add_users(user_id, username):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT OR IGNORE INTO users (user_id, username, first_seen, read_books)
+        VALUES (?, ?, ?, 0)
+        """, (user_id, username, datetime.now().date().isoformat()))
+        await db.commit()
+
+
+# ==================== /START ====================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await add_users(message.from_user.id, message.from_user.username)
+
+    logo_path = "970111763390b956fad9089dd2cefcf0.jpg"
+    caption = (
+        "📚 Привет, читатель!\n\n"
+        "Добро пожаловать в *BookBot* 📖\n\n"
+        "Выбери действие ниже:"
+    )
+
+    if os.path.exists(logo_path):
+        photo = FSInputFile(logo_path)
+        sent = await message.answer_photo(
+            photo=photo,
+            caption=caption,
+            reply_markup=start_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        sent = await message.answer(
+            caption,
+            reply_markup=start_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    await state.update_data(main_message_id=sent.message_id, current="start")
+
+
+
+# ==================== ДОБАВЛЕНИЕ КНИГ (ТОЛЬКО ДЛЯ АДМИНА) ====================
+@dp.message(Command("addbook"))
+async def add_book(message: types.Message):
+    if not is_admin(message.from_user.id):
+
+        await message.answer("⛔ У вас нет прав добавлять книги.")
+        return
+
+    try:
+        # Формат: /addbook Название | Описание | путь_к_файлу | путь_к_обложке
+        _, data = message.text.split(" ", 1)
+        title, desc, file_path, cover_path = map(str.strip, data.split("|"))
+    except Exception:
+        await message.answer("⚠️ Используй формат:\n`/addbook Название | Описание | путь_к_файлу | путь_к_обложке`", parse_mode="Markdown")
+        return
+
+    # Проверяем пути
+    if not os.path.exists(file_path):
+        await message.answer("❌ Файл книги не найден.")
+        return
+    if not os.path.exists(cover_path):
+        await message.answer("⚠️ Обложка не найдена, книга добавлена без картинки.")
+        cover_path = None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO books (title, description, file_path, cover_path) VALUES (?, ?, ?, ?)", 
+                         (title, desc, file_path, cover_path))
+        await db.commit()
+
+    await message.answer(f"✅ Книга *{title}* добавлена!", parse_mode="Markdown")
+
+
+
+
+# ==================== УДАЛЕНИЕ КНИГ (ТОЛЬКО ДЛЯ АДМИНА) ====================
+@dp.message(Command("deletebook"))
+async def delete_book_list(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет прав удалять книги.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, title FROM books")
+        books = await cur.fetchall()
+
+    if not books:
+        await message.answer("📚 В каталоге пока нет книг для удаления.")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"❌ {title}", callback_data=f"delbook_{book_id}")]
+        for book_id, title in books
+    ])
+    await message.answer("🗑 Выбери книгу, которую нужно удалить:", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("delbook_"))
+async def confirm_delete(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только админ может удалять книги.")
+        return
+
+    book_id = int(callback.data.split("_")[1])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT title FROM books WHERE id = ?", (book_id,))
+        book = await cur.fetchone()
+
+    if not book:
+        await callback.answer("❌ Книга не найдена.")
+        return
+
+    title = book[0]
+    # Подтверждение удаления
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirmdel_{book_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete")]
+    ])
+    await callback.message.answer(f"Вы уверены, что хотите удалить книгу *{title}*?", reply_markup=keyboard, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("confirmdel_"))
+async def delete_book(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет прав.")
+        return
+
+    book_id = int(callback.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM books WHERE id = ?", (book_id,))
+        await db.commit()
+
+    await callback.message.edit_text("✅ Книга успешно удалена.")
+
+
+@dp.callback_query(F.data == "cancel_delete")
+async def cancel_delete(callback: types.CallbackQuery):
+    await callback.message.edit_text("❎ Удаление отменено.")
+
+
+
+
+
+# ==================== КАТАЛОГ ====================
+@dp.callback_query(F.data == "catalog")
+async def show_catalog(callback: types.CallbackQuery, state: FSMContext):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, title, description FROM books")
+        books = await cur.fetchall()
+
+    text = "📚 *Каталог книг:*\n\n"
+    if not books:
+        text += "Пока что здесь пусто 😅"
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_start")]
+        ])
+    else:
+        keyboard = [
+            [InlineKeyboardButton(text=title, callback_data=f"book_{book_id}")]
+            for book_id, title, desc in books
+        ]
+        keyboard.append([InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_start")])
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    data = await state.get_data()
+    main_message_id = data.get("main_message_id")
+    logo_path = "970111763390b956fad9089dd2cefcf0.jpg"
+
+    try:
+        if os.path.exists(logo_path):
+            await bot.edit_message_media(
+                chat_id=callback.from_user.id,
+                message_id=main_message_id,
+                media=types.InputMediaPhoto(
+                    media=FSInputFile(logo_path),
+                    caption=text,
+                    parse_mode="Markdown"
+                ),
+                reply_markup=markup
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=callback.from_user.id,
+                message_id=main_message_id,
+                text=text,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+    except TelegramBadRequest:
+        pass
+
+    await state.update_data(current="catalog")
+
+
+
+# ==================== ПРОСМОТР КНИГИ ====================
+@dp.callback_query(F.data.startswith("book_"))
+async def show_book(callback: types.CallbackQuery, state: FSMContext):
+    book_id = int(callback.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT title, description, cover_path FROM books WHERE id = ?", (book_id,))
+        book = await cur.fetchone()
+
+    if not book:
+        await callback.answer("Книга не найдена.")
+        return
+
+    title, desc, cover_path = book
+    caption = f"📘 *{title}*\n\n{desc}"
+
+    # Удаляем старое сообщение книги, если оно есть
+    data = await state.get_data()
+    prev_book_message_id = data.get("book_message_id")
+    if prev_book_message_id:
+        try:
+            await bot.delete_message(callback.from_user.id, prev_book_message_id)
+        except Exception:
+            pass
+
+    # Удаляем сообщение каталога и сохраняем его ID
+    catalog_message_id = callback.message.message_id
+    await state.update_data(catalog_message_id=catalog_message_id)
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    # Отправляем новое сообщение с книгой
+    if cover_path and os.path.exists(cover_path):
+        sent = await callback.message.answer_photo(
+            photo=FSInputFile(cover_path),
+            caption=caption,
+            reply_markup=book_keyboard(book_id),
+            parse_mode="Markdown"
+        )
+    else:
+        sent = await callback.message.answer(
+            caption,
+            reply_markup=book_keyboard(book_id),
+            parse_mode="Markdown"
+        )
+
+    # Сохраняем ID сообщения книги и текущий статус
+    await state.update_data(book_message_id=sent.message_id, current="book")
+
+
+
+# ==================== ЧТЕНИЕ КНИГИ ====================
+@dp.callback_query(F.data.startswith("read_"))
+async def read_book(callback: types.CallbackQuery):
+    book_id = int(callback.data.split("_")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT title, file_path FROM books WHERE id = ?", (book_id,))
+        book = await cur.fetchone()
+
+    if not book:
+        await callback.answer("Книга не найдена.")
+        return
+
+    title, file_path = book
+    if not os.path.exists(file_path):
+        await callback.answer("Файл книги не найден на сервере.")
+        return
+
+    await callback.message.answer_document(
+        document=FSInputFile(file_path),
+        caption=f"📖 Вот книга: *{title}*",
+        parse_mode="Markdown"
+    )
+
+
+# ==================== ПРОФИЛЬ ====================
+@dp.callback_query(F.data == "profile")
+async def show_profile(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT first_seen, read_books FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+
+    if row:
+        first_seen, read_books = row
+        days_used = (datetime.now().date() - datetime.fromisoformat(first_seen).date()).days
+        profile_text = (
+            f"👤 *Имя:* {callback.from_user.first_name}\n"
+            f"📅 *Дней в боте:* {days_used}\n"
+            f"📖 *Прочитано книг:* {read_books}"
+        )
+    else:
+        profile_text = "Ошибка: пользователь не найден."
+
+    data = await state.get_data()
+    main_message_id = data.get("main_message_id")
+    logo_path = "970111763390b956fad9089dd2cefcf0.jpg"
+
+    try:
+        if os.path.exists(logo_path):
+            await bot.edit_message_media(
+                chat_id=callback.from_user.id,
+                message_id=main_message_id,
+                media=types.InputMediaPhoto(
+                    media=FSInputFile(logo_path),
+                    caption=profile_text,
+                    parse_mode="Markdown"
+                ),
+                reply_markup=back_to_start_keyboard()
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=callback.from_user.id,
+                message_id=main_message_id,
+                text=profile_text,
+                reply_markup=back_to_start_keyboard(),
+                parse_mode="Markdown"
+            )
+    except TelegramBadRequest:
+        pass
+
+    await state.update_data(current="profile")
+
+
+# ==================== ВОЗВРАТ НА ГЛАВНУЮ ====================
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+
+    # 1) Удаляем сообщение книги, если оно осталось
+    book_message_id = data.get("book_message_id")
+    if book_message_id:
+        try:
+            await bot.delete_message(callback.from_user.id, book_message_id)
+        except Exception:
+            pass
+        await state.update_data(book_message_id=None)
+
+    # 2) Удаляем сообщение каталога, если оно было сохранено отдельно
+    catalog_message_id = data.get("catalog_message_id")
+    if catalog_message_id:
+        try:
+            await bot.delete_message(callback.from_user.id, catalog_message_id)
+        except Exception:
+            pass
+        await state.update_data(catalog_message_id=None)
+
+    # 3) Если текущее callback.message — не главное (например, это сообщение каталога),
+    #    удаляем его, чтобы под стартом не оставалось лишнего сообщения.
+    main_message_id = data.get("main_message_id")
+    try:
+        if callback.message and callback.message.message_id != main_message_id:
+            await bot.delete_message(callback.from_user.id, callback.message.message_id)
+    except Exception:
+        pass
+
+    # 4) Формируем стартовый текст и путь до логотипа
+    logo_path = "970111763390b956fad9089dd2cefcf0.jpg"
+    caption = (
+        "📚 Привет, читатель!\n\n"
+        "Добро пожаловать в *BookBot* 📖\n\n"
+        "Выбери действие ниже:"
+    )
+
+    # 5) Пытаемся отредактировать существующее главное сообщение (если есть)
+    if main_message_id:
+        try:
+            if os.path.exists(logo_path):
+                await bot.edit_message_media(
+                    chat_id=callback.from_user.id,
+                    message_id=main_message_id,
+                    media=types.InputMediaPhoto(
+                        media=FSInputFile(logo_path),
+                        caption=caption,
+                        parse_mode="Markdown"
+                    ),
+                    reply_markup=start_keyboard()
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=callback.from_user.id,
+                    message_id=main_message_id,
+                    text=caption,
+                    reply_markup=start_keyboard(),
+                    parse_mode="Markdown"
+                )
+            # обновляем состояние
+            await state.update_data(current="start")
+            return
+        except TelegramBadRequest:
+            # если редактировать нельзя (например, сообщение удалено) — пойдём дальше и отправим новое
+            pass
+
+    # 6) Если мы не отредактировали старое (или его нет) — отправляем новое стартовое сообщение
+    if os.path.exists(logo_path):
+        sent = await callback.message.answer_photo(
+            photo=FSInputFile(logo_path),
+            caption=caption,
+            reply_markup=start_keyboard(),
+            parse_mode="Markdown"
+        )
+    else:
+        sent = await callback.message.answer(
+            caption,
+            reply_markup=start_keyboard(),
+            parse_mode="Markdown"
+        )
+
+    # 7) Сохраняем ID нового стартового сообщения
+    await state.update_data(main_message_id=sent.message_id, current="start")
+
+
+
+
+
+# ==================== НАЗАД ИЗ КНИГИ ====================
+@dp.callback_query(F.data == "back_to_catalog")
+async def back_to_catalog(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    current = data.get("current")
+
+    # Удаляем сообщение книги
+    book_message_id = data.get("book_message_id")
+    if book_message_id:
+        try:
+            await bot.delete_message(callback.from_user.id, book_message_id)
+        except Exception:
+            pass
+        await state.update_data(book_message_id=None)
+
+    # Восстанавливаем сообщение каталога
+    catalog_message_id = data.get("catalog_message_id")
+    if catalog_message_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT id, title FROM books")
+            books = await cur.fetchall()
+
+        text = "📚 *Каталог книг:*\n\n"
+        if not books:
+            text += "Пока что здесь пусто 😅"
+        keyboard = [
+            [InlineKeyboardButton(text=title, callback_data=f"book_{book_id}")]
+            for book_id, title in books
+        ]
+        keyboard.append([InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_start")])
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+        await bot.send_message(callback.from_user.id, text=text, reply_markup=markup, parse_mode="Markdown")
+        await state.update_data(current="catalog", catalog_message_id=None)
+
+
+        
+# ==================== ЗАПУСК ====================
+async def main():
+    await init_db()
+    print("Бот запущен ✅")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
